@@ -1,0 +1,95 @@
+#!/bin/bash -e
+
+if ! command -v keytool >/dev/null; then
+  echo "keytool is not found. Do you have Java installed?" >&2
+  exit 1
+fi
+
+if ! command -v apktool >/dev/null; then
+  echo "apktool is not found" >&2
+  exit 1
+fi
+
+if ! command -v apksigner >/dev/null || ! command -v zipalign >/dev/null; then
+  ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+
+  if [ ! -d "$ANDROID_HOME" ]; then
+    echo "Android SDK is not found" >&2
+    exit 1
+  fi
+
+  BUILD_TOOLS_DIR="$(test -d "$ANDROID_HOME/build-tools" && find "$ANDROID_HOME/build-tools" -type d -depth 1 | sort -r | head -n 1)"
+
+  if [ ! -d "$BUILD_TOOLS_DIR" ]; then
+    echo "Android build-tools is not found" >&2
+    exit 1
+  fi
+
+  export PATH="$BUILD_TOOLS_DIR:$PATH"
+
+  if ! command -v apksigner >/dev/null; then
+    echo "apksigner is not found in Android SDK" >&2
+    exit 1
+  fi
+
+  if ! command -v zipalign >/dev/null; then
+    echo "zipalign is not found in Android SDK" >&2
+    exit 1
+  fi
+fi
+
+if [ $# -lt 2 ]; then
+  echo "Usage: aonsc <in.apk> <out.apk> [file.keystore]"
+  exit
+fi
+
+IN_FILE="$1"
+OUT_FILE="$2"
+KEYSTORE_FILE="$3"
+
+if [ -z "$KEYSTORE_FILE" ]; then
+  if [ ! -f "$HOME/.android/debug.keystore" ]; then
+    echo '======================'
+    echo 'Generate keystore file'
+    echo '======================'
+    mkdir -p "$HOME/.android"
+    keytool -genkey -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -validity 36500 -dname "CN=Android Debug,O=Android,C=US" -deststoretype pkcs12
+    echo ''
+  fi
+  KEYSTORE_FILE="$HOME/.android/debug.keystore"
+fi
+
+if [ ! -f "$KEYSTORE_FILE" ]; then
+  echo "Keystore file \"$KEYSTORE_FILE\" is not found" >&2
+  exit 1
+fi
+
+BUILD_DIR="$(mktemp -d)"
+BUILD_FILE="$(mktemp)"
+trap 'rm -rf "$BUILD_DIR" "$BUILD_FILE"' EXIT
+
+echo '=============================='
+echo 'Decode APK and override config'
+echo '=============================='
+apktool d -f -s -o "$BUILD_DIR" "$IN_FILE"
+echo 'I: Overriding network security config...'
+mkdir -p "$BUILD_DIR/res/xml"
+echo '<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system"/>
+            <certificates src="user"/>
+        </trust-anchors>
+    </base-config>
+</network-security-config>' > "$BUILD_DIR/res/xml/network_security_config.xml"
+perl -pi -e 's|(<application\s+.*?)\s+android:networkSecurityConfig=".*?"(.*?>)|\1\2|' "$BUILD_DIR/AndroidManifest.xml"
+perl -pi -e 's|(<application\s+.*?)(\s*>)|\1 android:networkSecurityConfig="\@xml/network_security_config"\2|' "$BUILD_DIR/AndroidManifest.xml"
+echo ''
+
+echo '===================='
+echo 'Rebuild and sign APK'
+echo '===================='
+apktool b -o "$BUILD_FILE" "$BUILD_DIR"
+zipalign -p 4 "$BUILD_FILE" "$OUT_FILE"
+apksigner sign --ks "$KEYSTORE_FILE" --ks-pass pass:android "$OUT_FILE"
